@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.rwsave 修改器</title>
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <span class="title">.rwsave 修改器</span>
+  </div>
+  <div class="steps">
+    <div class="step" data-step="1"><i>1</i><span>选存档</span></div>
+    <div class="step" data-step="2"><i>2</i><span>挑单位</span></div>
+    <div class="step" data-step="3"><i>3</i><span>改字段</span></div>
+    <div class="step" data-step="4"><i>4</i><span>存新档</span></div>
+  </div>
+  <div class="topright">
+    <span id="pendingBadge" class="badge hidden">0 处待保存</span>
+    <button id="btnReset" class="btn ghost hidden">放弃全部修改</button>
+    <button id="btnSave" class="btn primary hidden">保存为新存档</button>
+  </div>
+</header>
+
+<main>
+  <!-- ============ 左：存档列表 ============ -->
+  <aside class="panel left">
+    <div class="panel-head">
+      <h2>存档</h2>
+      <button id="btnRescan" class="btn tiny ghost">刷新</button>
+    </div>
+    <div id="saveList" class="savelist"></div>
+  </aside>
+
+  <!-- ============ 中：单位列表 ============ -->
+  <section class="panel mid">
+    <div class="panel-head">
+      <h2 id="unitTitle">单位</h2>
+      <span id="unitCount" class="muted"></span>
+    </div>
+
+    <div id="filterBar" class="filters hidden">
+      <input id="q" type="search" placeholder="搜索单位类型 / 名称 / ID…">
+      <select id="fTeam"><option value="">全部队伍</option></select>
+      <select id="fKind">
+        <option value="">全部类别</option>
+        <option value="1">原版单位</option>
+        <option value="3">模组单位</option>
+        <option value="2">特殊对象</option>
+      </select>
+      <select id="fHp">
+        <option value="">全部血量</option>
+        <option value="hurt">残血 (&lt;50%)</option>
+        <option value="near">濒死 (&lt;20%)</option>
+        <option value="full">满血</option>
+      </select>
+      <button id="btnClearFilter" class="btn tiny ghost">清除</button>
+    </div>
+
+    <div id="bulkBar" class="bulkbar hidden">
+      <span class="muted">已选 <b id="selCount">0</b> 个</span>
+      <span class="sep"></span>
+      <select id="bulkField"></select>
+      <input id="bulkVal" type="text" placeholder="新值" size="10">
+      <button id="btnBulk" class="btn small">批量应用</button>
+      <button id="btnSelNone" class="btn tiny ghost">取消选择</button>
+    </div>
+
+    <div class="tablewrap">
+      <table id="unitTable">
+        <thead>
+          <tr>
+            <th class="c-pick"><input type="checkbox" id="pickAll"></th>
+            <th data-sort="i">#</th>
+            <th data-sort="type_name">类型</th>
+            <th data-sort="team" class="c-team">队伍</th>
+            <th data-sort="hp_ratio" class="c-hp">血量</th>
+            <th class="c-bar">比例</th>
+            <th data-sort="pos_x">X</th>
+            <th data-sort="pos_y">Y</th>
+            <th data-sort="rotation">朝向</th>
+            <th data-sort="kill_count">击杀</th>
+            <th class="c-flag">状态</th>
+            <th class="c-edit">已改</th>
+          </tr>
+        </thead>
+        <tbody id="unitBody"></tbody>
+      </table>
+      <div id="unitEmpty" class="empty hidden">请先在左侧选择一个存档</div>
+    </div>
+    <div id="pager" class="pager hidden">
+      <button id="pgPrev" class="btn tiny">上一页</button>
+      <span id="pgInfo" class="muted"></span>
+      <button id="pgNext" class="btn tiny">下一页</button>
+      <select id="pgSize">
+        <option>100</option><option selected>200</option>
+        <option>500</option><option>1000</option>
+      </select>
+    </div>
+  </section>
+
+  <!-- ============ 右：字段编辑 ============ -->
+  <section class="panel right">
+    <div class="panel-head">
+      <h2>字段</h2>
+      <label class="toggle"><input type="checkbox" id="showDanger"> 显示危险字段</label>
+    </div>
+    <div id="unitMeta" class="unitmeta"></div>
+    <div id="fieldPane" class="fields">
+      <div class="empty">在左侧列表点一个单位</div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<!-- ============ 保存弹窗 ============ -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>保存为新存档</h3>
+    <p class="muted">原存档不会被修改。产物写到独立目录，文件名带时间戳。</p>
+    <label>输出目录</label>
+    <input id="outDir" type="text" placeholder="留空则用默认目录">
+    <label>文件名</label>
+    <input id="outName" type="text" placeholder="留空则自动命名">
+    <div id="savePreview" class="savepreview"></div>
+    <div class="modal-actions">
+      <button id="btnCancelSave" class="btn ghost">取消</button>
+      <button id="btnConfirmSave" class="btn primary">确认保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="/web/app.js"></script>
+</body>
+</html>
