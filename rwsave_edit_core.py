@@ -609,6 +609,7 @@ def load_editable_from_bytes(buf, name="(buffer)"):
     r = TracingReader(root, 0, "ROOT")
     R.Reader = TracingReader
     R.OrderedDict = _sink_factory(r)
+    pv = meta["format_version"]
     try:
         cu = R.parse_custom_units(r)
         gs = R.parse_game_setup(r, meta["format_version"])
@@ -619,12 +620,16 @@ def load_editable_from_bytes(buf, name="(buffer)"):
         sh = R.parse_unit_shells(r)
         mid = R.parse_mid_scalars(r)
         stats = R.parse_stats(r)
-        ext = [R.parse_extended_team_state(r) for _ in range(n_ext)]
+        # 只有非空槽位才有扩展段；**AI 队伍多一段 AIController 前缀**
+        # （AIController extends PlayerTeam，super.a() 之前先写自己的字段）。
+        # 漏掉这层会让后续字节整体错位，报「布尔值非法 0xNN」。
+        ext = [R.parse_extended_team_state(r, is_ai=t.get("is_ai_controller"))
+               for t in tm["teams"] if t.get("exists")]
 
         # 单位数据段：**逐对象**收集绑定。
         # 不复用 R.parse_unit_data 是因为需要拿到「每个对象各自的」bindings，
         # 但读取逻辑完全照搬它的实现（对象数据 + magic short），不重写语义。
-        _parse_unit_data_traced(r, sh["shells"])
+        _parse_unit_data_traced(r, sh["shells"], pv)
         ud = _LAST_UD
 
         remaining = len(root) - r.pos
@@ -730,7 +735,7 @@ def _read_header(buf):
 _LAST_UD = None
 
 
-def _parse_unit_data_traced(r, shells):
+def _parse_unit_data_traced(r, shells, pv=999999):
     """单位数据段：逐对象解析，并保留每个对象自身的字段绑定。
 
     读取顺序严格照搬 `rwsave_inspector.parse_unit_data`：
@@ -742,7 +747,7 @@ def _parse_unit_data_traced(r, shells):
     objs, binds = [], []
     for sh in shells:
         start = r.pos
-        u = R.parse_one_unit(r, sh)
+        u = R.parse_one_unit(r, sh, pv)
         u["index"] = sh["index"]
         u["object_id"] = sh["object_id"]
         u["type_name"] = sh.get("type_name")

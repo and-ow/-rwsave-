@@ -487,14 +487,21 @@ def parse_mission(r):
         t = OrderedDict()
         t["unique_id"] = r.utf()
         t["is_active"] = r.boolean()
-        t["activation_time"] = r.int()
-        t["l"] = r.int()
-        t["has_completed"] = r.boolean()
-        t["n"] = r.int()
+        # ⚠️ 字段顺序与版本门槛严格照抄 MissionEngine.java:162-181：
+        #   if (i >= 2) { i4 = readInt(); i5 = readInt(); }
+        #   if (i >= 3) { z2 = readBoolean(); }
+        #   if (i >= 4) { i6 = readInt(); }
+        # 早先这里把 activation_time / l 无条件读、又在尾部多读两个 int，
+        # 导致**每个触发器多消耗 8 字节**，1282 个触发器就是 1 万字节错位
+        # （表现为后面某处报「布尔值非法」）。6 个旧样例都没走到这段
+        # （has_mission_engine=False），所以一直没暴露。
+        if ver >= 2:
+            t["activation_time"] = r.int()
+            t["l"] = r.int()
         if ver >= 3:
-            t["b"] = r.int()
-            if ver >= 5:
-                t["c"] = r.int()
+            t["has_completed"] = r.boolean()
+        if ver >= 4:
+            t["n"] = r.int()
         triggers.append(t)
     m["triggers"] = triggers
 
@@ -714,9 +721,215 @@ def parse_fog_state(r):
     return {"present": True, "width": w, "height": h, "data": data}
 
 
-def parse_extended_team_state(r, sv=999999):
-    """队伍扩展状态：基本状态 + 迷雾图 + 自定义资源 + 动画组。"""
+def _read_unit_id_list(r):
+    """count + N×单位引用（`writeOrderableUnit` → `readObjectId`，即 i64）。"""
+    n = r.int()
+    if n < 0 or n > (1 << 20):
+        raise SaveError("AI 托管单位数量异常：%d" % n)
+    return [r.long() for _ in range(n)]
+
+
+def parse_ai_strategy_node(r, type_id):
+    """AIStrategyNode.readFromInputStream —— **按 type_id 分派**。
+
+    写端 `AIController.a()` 先写 typeId + strategyId（第一轮），
+    再写 strategyId + 各子类自己的 `a()`（第二轮）。5 个子类的 body
+    长度各不相同，必须照源码逐个翻译：
+
+    | typeId | 类 | 源码 |
+    | --- | --- | --- |
+    | 1 | `BaseZone` | BaseZone.java:182 |
+    | 2 | `UnitGroup` | UnitGroup.java:150 |
+    | 3 | `TransporterGroup` | TransporterGroup.java:85 |
+    | 4 | `PlainZone` | 直接继承基类（只有 posX/posY/radius） |
+    | 5 | `RallyGroup` | RallyGroup.java:37 |
+
+    末尾统一调 `super.readFromInputStream()` = 3 个 float。
+    """
+    nd = OrderedDict()
+    nd["strategy_id"] = r.int()
+
+    if type_id == 1:                                  # BaseZone
+        nd["stage"] = r.int()
+        nd["zone_type"] = r.int()
+        for k in ("reclaim_score", "defensive_score", "last_found_building_priority",
+                  "update_timer", "land_units_score", "air_units_score",
+                  "water_units_score", "extractor_score"):
+            nd[k] = r.float()
+        b = r.byte()
+        nd["zone_version"] = b
+        if b >= 1:
+            nd["last_time_reclaimed"] = r.float()
+        if b >= 2:
+            nd["last_time_attacked_by_enemy"] = r.float()
+        if b >= 3:
+            nd["has_resources"] = r.boolean()
+            nd["has_land_access"] = r.boolean()
+        if b >= 4:
+            nd["last_attacked_timer"] = r.int()
+
+    elif type_id == 2:                                # UnitGroup
+        nd["is_ready_to_act"] = r.boolean()
+        nd["unused_int1"] = r.int()
+        nd["unused_int2"] = r.int()
+        nd["units"] = _read_unit_id_list(r)
+        b = r.byte()
+        nd["group_version"] = b
+        if b >= 1:
+            r.boolean()
+        if b >= 2:
+            nd["unused_flag2"] = r.boolean()
+        if b >= 3:
+            nd["attacking_duration"] = r.float()
+        if b >= 4:
+            nd["units_needing_transport"] = _read_unit_id_list(r)
+        if b >= 5:
+            nd["is_sea_group"] = r.boolean()
+        if b >= 6:
+            nd["is_active"] = r.boolean()
+            nd["requires_target"] = r.boolean()
+            nd["unused_flag1"] = r.boolean()
+            nd["retreat_when_damaged"] = r.boolean()
+            nd["is_retreating"] = r.boolean()
+            nd["target_unit"] = r.long()
+        if b >= 7:
+            nd["max_units"] = r.int()
+
+    elif type_id == 3:                                # TransporterGroup
+        nd["unused_flag1"] = r.boolean()
+        nd["unused_int1"] = r.int()
+        nd["unused_int2"] = r.int()
+        nd["units"] = _read_unit_id_list(r)
+        b = r.byte()
+        nd["transporter_version"] = b
+        if b >= 1:
+            nd["unit_group_id"] = r.int()
+        if b >= 2:
+            nd["is_waiting_for_units"] = r.boolean()
+        if b >= 3:
+            nd["transport_unit"] = r.long()
+        if b >= 4:
+            nd["delivery_timer"] = r.float()
+            nd["is_unloading"] = r.boolean()
+        if b >= 5:
+            nd["wait_pos_x"] = r.float()
+            nd["wait_pos_y"] = r.float()
+
+    elif type_id in (4, 0):                            # PlainZone（含 typeId=0 兜底）
+        pass
+
+    elif type_id == 5:                                # RallyGroup
+        nd["units"] = _read_unit_id_list(r)
+        if r.byte() >= 1:
+            nd["units_needing_transport"] = _read_unit_id_list(r)
+            nd["lifetime"] = r.float()
+
+    else:
+        raise SaveError("未知的 AI 策略节点类型 typeId=%d（1=BaseZone 2=UnitGroup "
+                        "3=TransporterGroup 4=PlainZone 5=RallyGroup）" % type_id)
+
+    # AIStrategyNode 基类：posX / posY / radius（AIStrategyNode.java:49）
+    nd["pos_x"] = r.float()
+    nd["pos_y"] = r.float()
+    nd["radius"] = r.float()
+    return nd
+
+
+def parse_ai_behavior(r):
+    """AIBehavior.a() —— UnitAIBehavior 写「托管单位数 + N×单位 ID」。
+
+    AIBehavior 基类的 a() 是空的；实际只有 UnitAIBehavior 子类带内容，
+    而 `AIBehaviorType` 只有 `unknown`(=0) 与 `nuking`(=1) 两个枚举，
+    后者创建的正是 UnitAIBehavior。`unknown` 的 createBehavior() 返回 null，
+    写端遇null 直接跳过——但仍占一个 ordinal。
+    """
+    b = OrderedDict()
+    b["managed_unit_ids"] = _read_unit_id_list(r)
+    return b
+
+
+def parse_ai_controller_state(r, pv=999999):
+    """AIController.readExtendedTeamState 中 `super` 之前的部分。
+
+    **只有 AI 队伍才有这段**：`AIController extends PlayerTeam`，写端
+    `AIController.a()` 在 `super.a()` 之前先写自己的字段
+    （AIController.java:544-600）。普通 `GameTeam` 直接走
+    `PlayerTeam.a()`，没有这段。
+
+    由 `parse_team_section()` 读到的 `is_ai_controller` 标志决定是否调用。
+    顺序完全照抄写端，不做任何猜测。
+    """
+    a = OrderedDict()
+    a["ai_enabled"] = r.boolean()
+    a["attack_timer_easy"] = r.float()
+    a["attack_timer_normal"] = r.float()
+    a["attack_timer_hard"] = r.float()
+    a["attack_timer_insane"] = r.float()
+    a["global_timer"] = r.float()
+    a["pathfinding_update_timer"] = r.int()
+    a["attack_range_multiplier"] = r.float()
+    a["can_build"] = r.boolean()
+    a["unit_production_timer"] = r.int()
+
+    # 策略节点：写端分两轮落盘（AIController.java:562-575）
+    n = r.int()
+    if n < 0 or n > 4096:
+        raise SaveError("AI 策略节点数量异常：%d" % n)
+    a["strategy_count"] = n
+    ids = []
+    for _ in range(n):                        # 第一轮：typeId + strategyId
+        ids.append((r.byte(), r.int()))
+    a["strategy_nodes"] = [parse_ai_strategy_node(r, tid) for tid, _sid in ids]
+
+    # 分块版本号（写端恒为 9）
+    ver = r.byte()
+    a["ai_block_version"] = ver
+    if ver >= 1:
+        a["next_strategy_id"] = r.int()
+    if ver >= 2:
+        a["enable_naval"] = r.boolean()
+        a["is_ready_for_attack"] = r.boolean()
+        a["has_sufficient_units_for_attack"] = r.boolean()
+    if ver >= 3:
+        a["is_waiting_for_better_attack_timing"] = r.boolean()
+        a["is_attack_allowed"] = r.boolean()
+    if ver >= 4:
+        a["attack_timers_update_counter"] = r.float()
+    if ver >= 5:
+        a["attack_cooldown_timer"] = r.int()
+    if ver >= 6:
+        a["map_width"] = r.int()
+        a["map_height"] = r.int()
+        a["map_seed"] = r.int()
+    if ver >= 7:
+        a["is_aggressive"] = r.boolean()
+    if ver >= 8:
+        a["ai_flags"] = r.int()
+    if ver >= 9:
+        r.magic("ai-c s")
+        cnt = r.int()
+        if cnt < 0 or cnt > 4096:
+            raise SaveError("AI 行为数量异常：%d" % cnt)
+        a["behavior_count"] = cnt
+        behaviors = []
+        for _ in range(cnt):
+            bt = r.int()                      # writeEnumOrdinal → readEnumOrdinalOrNull
+            behaviors.append({"type_ordinal": bt, "body": parse_ai_behavior(r)})
+        a["behaviors"] = behaviors
+        r.magic("ai-c e")
+    return a
+
+
+def parse_extended_team_state(r, sv=999999, is_ai=False, pv=999999):
+    """队伍扩展状态。
+
+    `is_ai=True` 时**必须**先读 `parse_ai_controller_state()`——
+    AIController 的 `super.a()` 之前写了自己的字段，漏掉会让后续全部错位
+    （表现为在下一个队伍处报「布尔值非法」）。
+    """
     t = OrderedDict()
+    if is_ai:
+        t["ai"] = parse_ai_controller_state(r, pv)
     t["basic"] = parse_basic_team_state(r, sv)
     if sv >= 44:
         ext_ver = r.byte()
@@ -768,9 +981,22 @@ def read_write_call(r, method, arg, label):
         return parse_factory_queue(r, label)
     if method == "__loop__":
         _cnt, inner = arg
-        return [OrderedDict(("%02d_%s" % (i, m), read_write_call(r, m, a, label))
-                            for i, (m, a) in enumerate(inner))
-                for _ in range(r._loop_count)]
+        # ⚠️ 这里必须用**显式循环**。
+        # 早先写成嵌套推导：
+        #     [OrderedDict(("%02d_%s" % (i, m), read_write_call(r, m, a, label))
+        #       for i, (m, a) in enumerate(inner)) for _ in range(r._loop_count)]
+        # 其中 `OrderedDict(...)` 落在推导式的 **key 位置**，内层只产出
+        # (key, value) 二元组，**`read_write_call` 根本没被调用** ——
+        # 于是循环照跑 N 次却一个字节都不读，游标不动 → 后续整体错位。
+        # 这个 bug 一直存在，只是前 6 个样例里没有任何单位带 transportedUnits，
+        # 所以从未触发；`dropship`(25) 是第一个命中的。
+        out = []
+        for _ in range(r._loop_count):
+            item = OrderedDict()
+            for i, (m, a) in enumerate(inner):
+                item["%02d_%s" % (i, m)] = read_write_call(r, m, a, label)
+            out.append(item)
+        return out
     if method == "writeFloat":
         return r.float()
     if method == "writeInt":
@@ -861,8 +1087,11 @@ def parse_buildings_projectile(r, label):
     return p
 
 
-def parse_unit_stats(r):
-    """单位被自定义属性覆盖的情况。"""
+def parse_unit_stats(r, version=None):
+    """单位被自定义属性覆盖的情况（`UnitStats.a`，UnitStats.java:454-471）。
+
+    `version` 只是为了与调用处签名一致，读端并不需要它。
+    """
     if r.boolean():
         return {"is_default": True}
     n = r.short()
@@ -872,54 +1101,93 @@ def parse_unit_stats(r):
     return {"is_default": False, "changed": n, "fields": fields}
 
 
-def parse_custom_unit(r, u, label):
-    """自定义单位（模组单位）的自有字段 + 后续继承链。"""
-    u["custom_unit_version"] = r.int()
-    u["frame_animation_timer"] = r.float()
-    u["transport_unload_timer"] = r.float()
-    u["is_unloading"] = r.boolean()
-    n = r.int()
-    u["transported_units"] = [r.long() for _ in range(n)]
-    u["field_r"] = r.boolean()
-    u["field_o"] = r.float()
-    u["frame_animation_delay"] = r.float()
-    u["field_s"] = r.float()
-    u["field_v"] = r.boolean()
-    nleg = r.byte()
-    legs = []
-    for _ in range(nleg):
-        legs.append(OrderedDict([("b", r.float()), ("c", r.float()), ("d", r.float()),
-                                 ("i", r.float()), ("k", r.boolean()), ("j", r.boolean()),
-                                 ("m", r.boolean()), ("n", r.boolean())]))
-    u["leg_instances"] = legs
-    u["factory_queue"] = parse_factory_queue(r, label)
-    u["factory_unit_config"] = r.unit_type()
-    u["frame_animation_reverse"] = r.boolean()
-    u["frame_animation_playing"] = r.boolean()
-    has_tag = r.boolean()
-    u["has_action_tag"] = has_tag
-    if has_tag:
-        u["current_action_handler"] = r.nullable_utf()
-    u["unit_stats"] = parse_unit_stats(r)
-    u["field_q"] = r.float()
-    parse_orderable_unit(r, u, label)
+def parse_custom_unit(r, u, label, pv=999999):
+    """自定义单位（模组单位）的自有字段 + 后续继承链。
+
+    ⚠️ 整段被**两层版本门槛**包住（CustomUnit.java:443 /456-517）：
+      1. 外层 `if (protocolVersion >= 32)` —— 不满足则**整段都不存在**；
+      2. 内层每个字段再按「该单位自己的版本号 i」逐个判断（`i >= 1` … `i >= 11`）。
+    早先的实现把它们**全部无条件读取**，于是版本号低于门槛的单位
+    会多消耗几十字节 → 后续字段整体错位（表现为远处报「布尔值非法」）。
+    """
+    if pv >= 32:
+        i = r.int()
+        u["custom_unit_version"] = i
+        u["frame_animation_timer"] = r.float()
+        u["transport_unload_timer"] = r.float()
+        u["is_unloading"] = r.boolean()
+        n = r.int()
+        if n < 0 or n > (1 << 20):
+            raise SaveError("运输单位数量异常：%d" % n)
+        u["transported_units"] = [r.long() for _ in range(n)]
+        if i >= 1:
+            u["field_r"] = r.boolean()
+        if i >= 2:
+            u["field_o"] = r.float()
+        if i >= 3:
+            u["frame_animation_delay"] = r.float()
+            u["field_s"] = r.float()
+        if i >= 4:
+            u["field_v"] = r.boolean()
+        if i >= 5:
+            nleg = r.byte()
+            legs = []
+            for _ in range(nleg):
+                legs.append(OrderedDict([
+                    ("b", r.float()), ("c", r.float()), ("d", r.float()),
+                    ("i", r.float()), ("k", r.boolean()), ("j", r.boolean()),
+                    ("m", r.boolean()), ("n", r.boolean())]))
+            u["leg_instances"] = legs
+        if i >= 6:
+            u["factory_queue"] = parse_factory_queue(r, label)
+        if i >= 7:
+            u["factory_unit_config"] = r.unit_type()
+        if i >= 8:
+            u["frame_animation_reverse"] = r.boolean()
+            u["frame_animation_playing"] = r.boolean()
+        if i >= 9:
+            has_tag = r.boolean()
+            u["has_action_tag"] = has_tag
+            if has_tag:
+                u["current_action_handler"] = r.nullable_utf()
+        if i >= 10:
+            u["unit_stats"] = parse_unit_stats(r, i)
+        if i >= 11:
+            u["field_q"] = r.float()
+    parse_orderable_unit(r, u, label, pv)
 
 
-def parse_unit_command(r):
-    """单位的一条指令（移动/攻击/采集…）。"""
+def parse_unit_command(r, pv=999999):
+    """UnitCommand.deserialize —— 严格照抄 UnitCommand.java:107-133。
+
+    字段**按协议版本分段**，不是无条件全读：
+        type(i32) / buildUnitType(`q()`) / targetX(f32) / targetY(f32) / targetUnitId(i64)
+        pv>=40: buildQueueSize(i8)
+        pv>=46: attackMoveRange(f32) / maxWayPointSurvivingTime(f32)
+        pv>=58: isRepeating(bool)
+        pv>=65: isQueued(bool)
+        pv>=79: isForceMove(bool)
+        pv>=82: actionId(nullable UTF)
+    """
     c = OrderedDict()
     c["type"] = r.int()
     c["unit_type"] = r.unit_type()
     c["x"] = r.float()
     c["y"] = r.float()
     c["target_id"] = r.long()
-    c["arg"] = r.byte()
-    c["f1"] = r.float()
-    c["f2"] = r.float()
-    c["b1"] = r.boolean()
-    c["b2"] = r.boolean()
-    c["b3"] = r.boolean()
-    c["action_id"] = r.nullable_utf()
+    if pv >= 40:
+        c["build_queue_size"] = r.byte()
+    if pv >= 46:
+        c["attack_move_range"] = r.float()
+        c["max_waypoint_surviving_time"] = r.float()
+    if pv >= 58:
+        c["is_repeating"] = r.boolean()
+    if pv >= 65:
+        c["is_queued"] = r.boolean()
+    if pv >= 79:
+        c["is_force_move"] = r.boolean()
+    if pv >= 82:
+        c["action_id"] = r.nullable_utf()
     return c
 
 
@@ -950,14 +1218,16 @@ def parse_air_effects(r, label):
     return eff
 
 
-def parse_orderable_unit(r, u, label):
+def parse_orderable_unit(r, u, label, pv=999999):
     """可命令单位的通用字段（移动、攻击、路径、编队…）。"""
     u["blocked_recovery_time"] = r.float()
     u["move_throttle"] = r.float()
     u["movement_level0_rotation"] = r.float()
     u["waypoint_count"] = r.int()
-    cnt = r.int()
-    u["waypoints"] = [parse_unit_command(r) for _ in range(cnt)]
+    # OrderableUnit.java:700-712：写端恒 30；协议 >=42 时才从流里再读一个真实条数。
+    cnt = r.int() if pv >= 42 else 30
+    u["waypoint_slots"] = cnt
+    u["waypoints"] = [parse_unit_command(r, pv) for _ in range(cnt)]
     u["attack_mode"] = r.int()
     u["attack_target_id"] = r.long()
     u["turret_rotation"] = r.float()
@@ -1118,21 +1388,89 @@ def parse_unit_or_placeholder(r):
 
 
 def parse_variable_scope(r):
-    """单位自定义变量。"""
-    kind = r.i8()
-    if kind == -2:
-        return {"kind": -2, "null": True, "values": []}
-    if kind == -1:
-        return {"kind": -1, "empty": True, "values": []}
+    """单位自定义变量 —— 严格照抄 `VariableScope.readIn`（VariableScope.java:778-791）。
+
+    ⚠️ 两个与直觉相反、且极易写错的地方：
+
+    1. **那个 boolean 是「没有值」，不是「有值」**：
+       `if (!readBoolean()) { setDataRaw(name, readInDynamicData(...)); }`
+       写端恒写 `false`（即「总有值」），所以**正常情况这个字节恒为 0**。
+       早先的实现把它当成 `has_value` 再紧跟一个 type，
+       于是每个变量多消耗 4 字节 → 后面整体错位。
+    2. **类型标签是 `LogicBoolean.ReturnType` 的 ordinal，不是任意 int**，
+       取值范围见下表；读完标签还要按类型再读一个**变长**的payload。
+    """
+    kind = r.i8()                   # 必须按**有符号**读：-1 / -2 是哨兵值
+    if kind == -2 or kind == -1:
+        return {"kind": kind, "null_or_empty": True, "values": []}
     n = r.short()
     vals = []
     for _ in range(n):
         name = r.utf()
-        has = r.boolean()
-        t = r.int()
-        v = r.double() if has else None
-        vals.append({"name": name, "has_value": has, "type": t, "value": v})
-    return {"kind": kind, "empty": False, "size": n, "values": vals}
+        is_empty = r.boolean()        # true = 该变量**没有**数据
+        if is_empty:
+            vals.append({"name": name, "empty": True})
+            continue
+        vals.append({"name": name, "empty": False,
+                     "value": parse_variable_data(r)})
+    return {"kind": kind, "size": n, "values": vals}
+
+
+# LogicBoolean.ReturnType 的枚举顺序（LogicBoolean.java:96-106）
+RETURN_TYPE_NAMES = {
+    0: "undefined", 1: "voidReturn", 2: "bool", 3: "number",
+    4: "unit", 5: "string", 6: "point",
+    7: "boolArray", 8: "numberArray", 9: "unitArray",
+}
+
+
+def parse_variable_data(r):
+    """`VariableScope.readInDynamicData`（VariableScope.java:880-925）。
+
+    标签之后按ReturnType 读**不同长度**的 payload，所以必须严格分派。
+    """
+    t = r.int()
+    d = OrderedDict()
+    d["type_ordinal"] = t
+    d["type_name"] = RETURN_TYPE_NAMES.get(t, "ReturnType#%d" % t)
+    if t == 0:                       # undefined → 写端写的是 null ordinal(-1)，此处不读额外数据
+        return d
+    if t == 2:                       # bool
+        d["value"] = r.boolean()
+    elif t == 3:                     # number
+        d["value"] = r.double()
+    elif t == 5:                     # string
+        d["value"] = r.nullable_utf()
+    elif t == 4:                     # unit
+        d["value"] = parse_unit_or_placeholder(r)
+    elif t in (7, 8, 9):             # 三种数组
+        cnt = r.int()
+        d["count"] = cnt
+        if cnt < 0 or cnt > (1 << 22):
+            raise SaveError("变量数组长度异常：%d" % cnt)
+        if t == 7:
+            d["values"] = [r.boolean() for _ in range(cnt)]
+        elif t == 8:
+            d["values"] = [r.float() for _ in range(cnt)]
+        else:
+            d["values"] = [parse_unit_or_placeholder(r) for _ in range(cnt)]
+    else:
+        raise SaveError("未实现的变量类型 ReturnType=%d（%s）"
+                        % (t, RETURN_TYPE_NAMES.get(t, "?")))
+    return d
+
+
+def parse_unit_or_placeholder(r):
+    """`VariableScope.readInUnitOrPlaceholder`（VariableScope.java:857-878）。"""
+    kind = r.byte()
+    if kind == 0:
+        return {"kind": 0, "object_id": r.long()}
+    if kind == 1:                     # DummyNonUnitWithTeam 占位符
+        return {"kind": 1,
+                "pos_x": r.float(), "pos_y": r.float(),
+                "pos_z": r.float(), "rotation_speed": r.float(),
+                "team": r.byte()}
+    raise SaveError("未处理的单位引用类型 %d" % kind)
 
 
 def parse_unit_type_id(r):
@@ -1321,7 +1659,7 @@ def parse_effect_emitter(r):
     return e
 
 
-def parse_one_unit(r, shell):
+def parse_one_unit(r, shell, pv=999999):
     """按外壳类型分派，读取单个单位的完整数据。"""
     label = "对象#%d(%s)" % (shell["index"], shell.get("type_name", "?"))
     if shell["kind"] == SHELL_BASIC:
@@ -1345,9 +1683,9 @@ def parse_one_unit(r, shell):
             parse_base_unit(r, u)
         else:
             u["chain_entry"] = chain_entry or "OrderableUnit"
-            parse_orderable_unit(r, u, label)
+            parse_orderable_unit(r, u, label, pv)
     else:
-        parse_custom_unit(r, u, label)
+        parse_custom_unit(r, u, label, pv)
     return u
 
 
@@ -1368,13 +1706,13 @@ def parse_scorch_mark(r):
     return o
 
 
-def parse_unit_data(r, shells):
+def parse_unit_data(r, shells, pv=999999):
     """单位数据段：逐对象读取，每个对象后必须跟一个对齐标记。"""
     marker = r.magic("start of unit data")
     objs = []
     for sh in shells:
         start = r.pos
-        u = parse_one_unit(r, sh)
+        u = parse_one_unit(r, sh, pv)
         u["index"] = sh["index"]
         u["object_id"] = sh["object_id"]
         u["type_name"] = sh.get("type_name")
@@ -1506,9 +1844,15 @@ def parse_save(path):
 
     st = r.pos
     ext = []
-    for _ in range(n_ext):
-        e = parse_extended_team_state(r)
+    # 只有非空槽位才有扩展段；**AI 队伍多一段 AIController 前缀**，
+    # 必须按队伍表里的 is_ai_controller 标志逐段区分。
+    for t in tm["teams"]:
+        if not t["exists"]:
+            continue
+        e = parse_extended_team_state(r, is_ai=t.get("is_ai_controller"))
         e["offset"] = r.pos
+        e["team_index"] = t["index"]
+        e["is_ai_controller"] = t.get("is_ai_controller")
         ext.append(e)
     seg("队伍扩展段", st, {"segments": len(ext)})
 
